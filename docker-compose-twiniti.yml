@@ -32,6 +32,8 @@ x-sentry-defaults: &sentry_defaults
     args:
       - SENTRY_IMAGE
   depends_on:
+    auto-migrate:
+      condition: service_completed_successfully
     redis:
       <<: *depends_on-healthy
     kafka:
@@ -99,18 +101,27 @@ x-snuba-defaults: &snuba_defaults
     # To start, state these environment variables below on your `.env.` file and adjust the options as needed.
     SNUBA_STATSD_ADDR: "${STATSD_ADDR:-}"
 services:
-  # Serviço para gerar configs iniciais (rode apenas uma vez)
-  init-config:
+  # Setup automático - roda apenas na primeira vez
+  auto-setup:
     image: alpine:latest
+    restart: "no"
     working_dir: /app
     volumes:
       - ./sentry:/app/sentry
       - ./relay:/app/relay
       - ./symbolicator:/app/symbolicator
+      - sentry-data:/data
     command:
       - sh
       - -c
       - |
+        # Verifica se já foi inicializado
+        if [ -f /data/.setup_complete ]; then
+          echo "✓ Setup já foi executado anteriormente, pulando..."
+          exit 0
+        fi
+
+        echo "Executando setup inicial..."
         apk add --no-cache openssl coreutils
 
         # Copiar arquivos de exemplo se não existirem
@@ -138,9 +149,33 @@ services:
           echo "✓ Relay credentials geradas"
         fi
 
-        echo "✓ Configurações prontas!"
-    profiles:
-      - setup
+        # Marca como concluído
+        touch /data/.setup_complete
+        echo "✓ Setup inicial completo!"
+
+  # Migrations automáticas - roda após o setup e antes dos serviços principais
+  auto-migrate:
+    <<: *sentry_defaults
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        # Verifica se já rodou migrations
+        if [ -f /data/.migrations_complete ]; then
+          echo "✓ Migrations já foram executadas, pulando..."
+          exit 0
+        fi
+
+        echo "Executando migrations..."
+        sentry upgrade --noinput
+
+        # Marca como concluído
+        touch /data/.migrations_complete
+        echo "✓ Migrations completas!"
+    depends_on:
+      auto-setup:
+        condition: service_completed_successfully
 
   smtp:
     <<: *restart_policy
@@ -856,17 +891,11 @@ services:
 volumes:
   # These store application data that should persist across restarts.
   sentry-data:
-    external: true
   sentry-postgres:
-    external: true
   sentry-redis:
-    external: true
   sentry-kafka:
-    external: true
   sentry-clickhouse:
-    external: true
   sentry-seaweedfs:
-    external: true
   # The volume stores cached version of debug symbols, source maps etc. Upon
   # removal symbolicator will re-download them.
   sentry-symbolicator:
